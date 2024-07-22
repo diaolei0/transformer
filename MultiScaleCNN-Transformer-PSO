@@ -1,0 +1,759 @@
+#第一部分导入库等
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import random
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+import joblib
+# 加载数据
+file_paths = [
+    '/mnt/workspace/整合1.xlsx',
+    '/mnt/workspace/整合2.xlsx',
+    '/mnt/workspace/整合3.xlsx',
+    '/mnt/workspace/整合4.xlsx'
+]
+
+data_frames = [pd.read_excel(file_path) for file_path in file_paths]
+data = pd.concat(data_frames, ignore_index=True)
+
+# 分组提取输入序列和目标序列
+input_sequences = []
+target_sequences = []
+
+for i in range(0, len(data) - 63, 63):  # 确保每组包含63行，并避免越界
+    input_sequence = data.iloc[i, :9].values  # 每组的第一行作为输入序列
+    target_sequence = data.iloc[i:i + 63, 10].values  # 每组的第11列的第1到第63行作为目标序列
+    input_sequences.append(input_sequence)
+    target_sequences.append(target_sequence)
+
+input_sequences = np.array(input_sequences)
+target_sequences = np.array(target_sequences)
+
+print("Input sequences shape:", input_sequences.shape)
+print("Target sequences shape:", target_sequences.shape)
+
+# 数据标准化
+input_scaler = StandardScaler()
+target_scaler = StandardScaler()
+
+input_sequences = input_scaler.fit_transform(input_sequences.reshape(-1, input_sequences.shape[-1])).reshape(
+    input_sequences.shape)
+target_sequences = target_scaler.fit_transform(target_sequences.reshape(-1, 1)).reshape(target_sequences.shape)
+
+# 保存标准化器以便预测时使用
+joblib.dump(input_scaler, 'input_scaler.pkl2')
+joblib.dump(target_scaler, 'target_scaler.pkl2')
+# 创建自定义数据集类
+class SimpleDataset(Dataset):
+    def __init__(self, input_sequences, target_sequences):
+        self.input_sequences = torch.tensor(input_sequences, dtype=torch.float32)
+        self.target_sequences = torch.tensor(target_sequences, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.input_sequences)
+
+    def __getitem__(self, idx):
+        return self.input_sequences[idx], self.target_sequences[idx]
+
+dataset = SimpleDataset(input_sequences, target_sequences)
+
+# 划分训练集、验证集和测试集
+train_size = int(0.8 * len(dataset))
+val_size = int(0.1 * len(dataset))
+test_size = len(dataset) - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+#第二部分 训练和验证模型
+
+class CustomSmoothL1Loss(nn.Module):
+    def __init__(self, beta=1.0):
+        super(CustomSmoothL1Loss, self).__init__()
+        self.beta = beta
+
+    def forward(self, input, target):
+        diff = torch.abs(input - target)
+        loss = torch.where(diff < self.beta, 0.5 * diff ** 2 / self.beta, diff - 0.5 * self.beta)
+        return loss.mean()
+
+# 定义位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+# 定义Transformer模型
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, target_dim, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6,
+                 dim_feedforward=2048, dropout=0.1):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.src_embedding = nn.Linear(input_dim, d_model)
+        self.tgt_embedding = nn.Linear(target_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward,
+                                          dropout)
+        self.d_model = d_model
+        self.decoder = nn.Linear(d_model, target_dim)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, src, tgt, tgt_mask):
+        # 编码器输入
+        src = self.src_embedding(src) * np.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+
+        # 解码器输入
+        tgt = self.tgt_embedding(tgt) * np.sqrt(self.d_model)
+        tgt = self.pos_encoder(tgt)
+
+        output = self.transformer(src, tgt, tgt_mask=tgt_mask)
+        output = self.decoder(output)
+        return output
+
+# 生成上三角掩码
+def generate_square_subsequent_mask(sz):
+    mask = torch.triu(torch.ones(sz, sz)) == 1
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+# 模型参数
+input_dim = input_sequences.shape[1]
+target_dim = 1
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TransformerModel(input_dim=input_dim, target_dim=target_dim).to(device)
+
+# 定义损失函数和优化器
+criterion = CustomSmoothL1Loss(beta=0.8)  # 设定自定义阈值beta
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+# 训练和验证过程
+num_epochs = 50
+
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0
+    for input_seq, target_seq in train_loader:
+        optimizer.zero_grad()
+        input_seq, target_seq = input_seq.to(device), target_seq.to(device)
+        input_seq = input_seq.unsqueeze(1).permute(1, 0, 2)  # [1, batch_size, input_dim]
+
+        # 编码器生成上下文向量
+        encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+        encoder_output = model.pos_encoder(encoder_output)
+        memory = model.transformer.encoder(encoder_output)
+
+        # 准备解码器输入和掩码
+        decoder_input = torch.zeros((target_seq.size(1), target_seq.size(0), 1), device=target_seq.device)
+        tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+        # 自回归预测
+        for t in range(1, target_seq.size(1)):
+            decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+        decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+        decoder_input = model.pos_encoder(decoder_input)
+        output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+        output = model.decoder(output)
+
+        loss = criterion(output.permute(1, 0, 2).squeeze(2), target_seq)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+
+    train_loss /= len(train_loader)
+
+    # 验证过程
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for input_seq, target_seq in val_loader:
+            input_seq, target_seq = input_seq.to(device), target_seq.to(device)
+            input_seq = input_seq.unsqueeze(1).permute(1, 0, 2)  # [1, batch_size, input_dim]
+
+            # 编码器生成上下文向量
+            encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+            encoder_output = model.pos_encoder(encoder_output)
+            memory = model.transformer.encoder(encoder_output)
+
+            # 准备解码器输入和掩码
+            decoder_input = torch.zeros((target_seq.size(1), target_seq.size(0), 1), device=target_seq.device)
+            tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+            # 自回归预测
+            for t in range(1, target_seq.size(1)):
+                decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+            decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+            decoder_input = model.pos_encoder(decoder_input)
+            output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+            output = model.decoder(output)
+
+            loss = criterion(output.permute(1, 0, 2).squeeze(2), target_seq)
+            val_loss += loss.item()
+
+    val_loss /= len(val_loader)
+
+    print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, Validation Loss: {val_loss}")
+
+# 保存模型
+model_path = 'transformer_model_no_teacher_forcing_自定义阈值.pth'
+torch.save(model.state_dict(), model_path)
+
+#第三部分 测试模型
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import random
+import matplotlib.font_manager as font_manager
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import os
+
+# 假设字体文件 times.ttf 在当前工作目录
+font_path = '/mnt/workspace/times.ttf'  # 确认路径正确
+font_manager.fontManager.addfont(font_path)
+font_prop = font_manager.FontProperties(fname=font_path, size=18)  # 设置字体大小为 18
+
+# 图例字体大小
+legend_font_prop = font_manager.FontProperties(fname=font_path, size=12)  # 设置对比图图例字体大小为 12
+error_legend_font_prop = font_manager.FontProperties(fname=font_path, size=14)  # 设置误差图图例字体大小为 14
+
+# 确保保存图片的目录存在
+save_dir = '/mnt/workspace/图片'
+os.makedirs(save_dir, exist_ok=True)
+
+# 测试过程
+test_loss = 0
+model.eval()
+test_predictions = []
+test_targets = []
+with torch.no_grad():
+    for input_seq, target_seq in test_loader:
+        input_seq, target_seq = input_seq.to(device), target_seq.to(device)
+        input_seq = input_seq.unsqueeze(1).permute(1, 0, 2)  # [1, batch_size, input_dim]
+
+        # 编码器生成上下文向量
+        encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+        encoder_output = model.pos_encoder(encoder_output)
+        memory = model.transformer.encoder(encoder_output)
+
+        # 准备解码器输入和掩码
+        decoder_input = torch.zeros((target_seq.size(1), target_seq.size(0), 1), device=target_seq.device)
+        tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+        # 自回归预测
+        for t in range(1, target_seq.size(1)):
+            decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+        decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+        decoder_input = model.pos_encoder(decoder_input)
+        output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+        output = model.decoder(output)
+
+        loss = criterion(output.permute(1, 0, 2).squeeze(2), target_seq)
+        test_loss += loss.item()
+
+        test_predictions.append(output.permute(1, 0, 2).squeeze(2).cpu().numpy())
+        test_targets.append(target_seq.cpu().numpy())
+
+test_loss /= len(test_loader)
+print(f"Test Loss: {test_loss}")
+
+# 将所有测试集的预测结果和真实结果拼接起来
+test_predictions = np.concatenate(test_predictions, axis=0)
+test_targets = np.concatenate(test_targets, axis=0)
+
+# 反标准化预测值和真实值
+test_predictions = target_scaler.inverse_transform(test_predictions)
+test_targets = target_scaler.inverse_transform(test_targets)
+
+# 计算误差指标
+mse = mean_squared_error(test_targets, test_predictions)
+rmse = np.sqrt(mse)
+mae = mean_absolute_error(test_targets, test_predictions)
+r2 = r2_score(test_targets, test_predictions)
+mape = np.mean(np.abs((test_targets - test_predictions) / test_targets)) * 100
+
+# 输出误差指标
+print(f"Mean Squared Error (MSE): {mse:.4f}")
+print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
+print(f"Mean Absolute Error (MAE): {mae:.4f}")
+print(f"R-squared (R²): {r2:.4f}")
+print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+
+# 频率数组
+frequency = np.array([
+    500, 515, 530, 545, 560, 580, 600, 615, 630, 650, 670, 690, 710, 730, 750, 775, 
+    800, 825, 850, 875, 900, 925, 950, 975, 1000, 1030, 1060, 1090, 1120, 1150, 
+    1180, 1220, 1250, 1280, 1320, 1360, 1400, 1450, 1500, 1550, 1600, 1650, 1700, 
+    1750, 1800, 1850, 1900, 1950, 2000, 2060, 2120, 2180, 2240, 2300, 2360, 2430, 
+    2500, 2580, 2650, 2720, 2800, 2900, 3000
+])
+
+# 计算预测误差
+prediction_error = test_predictions - test_targets
+
+# 绘制误差分析图，增加标准差误差的绘制
+plt.figure(figsize=(12, 6))
+
+plt.fill_between(frequency, prediction_error.mean(axis=0), color='orange', alpha=0.5, label='Error between prediction and target curve')
+
+# 计算并绘制标准差误差
+predictions_std = np.std(test_predictions, axis=0)
+targets_std = np.std(test_targets, axis=0)
+std_error = predictions_std - targets_std
+plt.plot(frequency, std_error, color='purple', linestyle='-', marker='o', alpha=0.7, label='Standard Deviation Error')
+
+plt.xlabel('Frequency (Hz)', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Error value', fontsize=16, fontproperties=font_prop)
+plt.legend(loc='lower right', fontsize=14, prop=error_legend_font_prop)  # 设置图例位置和字体
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)  # 设置x轴刻度字体大小
+plt.yticks(fontproperties=font_prop, fontsize=14)  # 设置y轴刻度字体大小
+plt.savefig(os.path.join(save_dir, 'error_analysis_with_std_error.png'))  # 保存图片
+plt.show()
+
+# 绘制预测值与实际值的散点图
+plt.figure(figsize=(12, 6))
+plt.scatter(test_targets.flatten(), test_predictions.flatten(), alpha=0.5, color='red')
+plt.plot([test_targets.min(), test_targets.max()], [test_targets.min(), test_targets.max()], 'k--', lw=2)
+plt.xlabel('Actual Values', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Predicted Values', fontsize=16, fontproperties=font_prop)
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)
+plt.yticks(fontproperties=font_prop, fontsize=14)
+plt.savefig(os.path.join(save_dir, 'predictions_vs_actuals.png'))  # 保存图片
+plt.show()
+
+# 绘制残差图
+plt.figure(figsize=(12, 6))
+residuals = test_predictions.flatten() - test_targets.flatten()
+plt.scatter(test_targets.flatten(), residuals, alpha=0.5, color='blue')
+plt.axhline(y=0, color='k', linestyle='--', lw=2)
+plt.xlabel('Actual Values', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Residuals', fontsize=16, fontproperties=font_prop)
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)
+plt.yticks(fontproperties=font_prop, fontsize=14)
+plt.savefig(os.path.join(save_dir, 'residual_plot.png'))  # 保存图片
+plt.show()
+
+# 绘制图像
+num_samples_per_fig = 10
+num_figs = 4
+colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black', 'purple', 'orange', 'pink']
+
+for fig_idx in range(num_figs):
+    fig, ax = plt.subplots(figsize=(15, 10))
+    random_indices = random.sample(range(test_predictions.shape[0]), num_samples_per_fig)
+
+    for color_idx, idx in enumerate(random_indices):
+        color = colors[color_idx % len(colors)]
+        ax.plot(frequency, test_targets[idx], color=color, marker='^', linestyle='-', alpha=0.5, label=f'True Sample {idx+1}')
+        ax.plot(frequency, test_predictions[idx], color=color, marker='s', linestyle='--', alpha=0.5, label=f'Predicted Sample {idx+1}')
+
+    ax.legend(fontsize=12, prop=legend_font_prop)  # 设置对比图图例字体
+    ax.set_xlabel('Frequency (Hz)', fontsize=20, fontproperties=font_prop)
+    ax.set_ylabel('Sound absorption coefficient', fontsize=20, fontproperties=font_prop)
+    ax.tick_params(axis='both', which='major', labelsize=18, labelcolor='black', labelrotation=0)  # 调整刻度标签字体大小
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontproperties(font_prop)
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'test_samples_comparison_{fig_idx + 1}.png'))  # 保存图片
+    plt.show()
+
+#第四部分 误差绘制
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import random
+import matplotlib.font_manager as font_manager
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import os
+
+# 假设字体文件 times.ttf 在当前工作目录
+font_path = '/mnt/workspace/times.ttf'  # 确认路径正确
+font_manager.fontManager.addfont(font_path)
+font_prop = font_manager.FontProperties(fname=font_path, size=18)  # 设置字体大小为 18
+
+# 图例字体大小
+legend_font_prop = font_manager.FontProperties(fname=font_path, size=12)  # 设置对比图图例字体大小为 12
+error_legend_font_prop = font_manager.FontProperties(fname=font_path, size=14)  # 设置误差图图例字体大小为 14
+
+# 确保保存图片的目录存在
+save_dir = '/mnt/workspace/图片'
+os.makedirs(save_dir, exist_ok=True)
+
+# 测试过程
+test_loss = 0
+model.eval()
+test_predictions = []
+test_targets = []
+with torch.no_grad():
+    for input_seq, target_seq in test_loader:
+        input_seq, target_seq = input_seq.to(device), target_seq.to(device)
+        input_seq = input_seq.unsqueeze(1).permute(1, 0, 2)  # [1, batch_size, input_dim]
+
+        # 编码器生成上下文向量
+        encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+        encoder_output = model.pos_encoder(encoder_output)
+        memory = model.transformer.encoder(encoder_output)
+
+        # 准备解码器输入和掩码
+        decoder_input = torch.zeros((target_seq.size(1), target_seq.size(0), 1), device=target_seq.device)
+        tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+        # 自回归预测
+        for t in range(1, target_seq.size(1)):
+            decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+        decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+        decoder_input = model.pos_encoder(decoder_input)
+        output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+        output = model.decoder(output)
+
+        loss = criterion(output.permute(1, 0, 2).squeeze(2), target_seq)
+        test_loss += loss.item()
+
+        test_predictions.append(output.permute(1, 0, 2).squeeze(2).cpu().numpy())
+        test_targets.append(target_seq.cpu().numpy())
+
+test_loss /= len(test_loader)
+print(f"Test Loss: {test_loss}")
+
+# 将所有测试集的预测结果和真实结果拼接起来
+test_predictions = np.concatenate(test_predictions, axis=0)
+test_targets = np.concatenate(test_targets, axis=0)
+
+# 反标准化预测值和真实值
+test_predictions = target_scaler.inverse_transform(test_predictions)
+test_targets = target_scaler.inverse_transform(test_targets)
+
+# 计算每个频率点的误差指标
+n_frequencies = test_predictions.shape[1]
+mse_list = []
+rmse_list = []
+mae_list = []
+
+for i in range(n_frequencies):
+    mse = mean_squared_error(test_targets[:, i], test_predictions[:, i])
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(test_targets[:, i], test_predictions[:, i])
+    
+    mse_list.append(mse)
+    rmse_list.append(rmse)
+    mae_list.append(mae)
+
+# 输出每个频率点的误差指标
+print(f"Mean Squared Error (MSE) per frequency: {mse_list}")
+print(f"Root Mean Squared Error (RMSE) per frequency: {rmse_list}")
+print(f"Mean Absolute Error (MAE) per frequency: {mae_list}")
+
+# 频率数组
+frequency = np.array([
+    500, 515, 530, 545, 560, 580, 600, 615, 630, 650, 670, 690, 710, 730, 750, 775, 
+    800, 825, 850, 875, 900, 925, 950, 975, 1000, 1030, 1060, 1090, 1120, 1150, 
+    1180, 1220, 1250, 1280, 1320, 1360, 1400, 1450, 1500, 1550, 1600, 1650, 1700, 
+    1750, 1800, 1850, 1900, 1950, 2000, 2060, 2120, 2180, 2240, 2300, 2360, 2430, 
+    2500, 2580, 2650, 2720, 2800, 2900, 3000
+])
+
+# 计算预测误差
+prediction_error = test_predictions - test_targets
+
+# 绘制误差分析图，增加标准差误差的绘制
+plt.figure(figsize=(12, 6))
+
+plt.fill_between(frequency, prediction_error.mean(axis=0), color='orange', alpha=0.5, label='Error between prediction and target curve')
+
+# 计算并绘制标准差误差
+predictions_std = np.std(test_predictions, axis=0)
+targets_std = np.std(test_targets, axis=0)
+std_error = predictions_std - targets_std
+plt.plot(frequency, std_error, color='purple', linestyle='-', marker='o', alpha=0.7, label='Standard Deviation Error')
+
+# 绘制各误差指标曲线
+plt.plot(frequency, mse_list, label='MSE', linestyle='-', marker='x')
+plt.plot(frequency, rmse_list, label='RMSE', linestyle='-', marker='x')
+plt.plot(frequency, mae_list, label='MAE', linestyle='-', marker='x')
+
+plt.xlabel('Frequency (Hz)', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Error value', fontsize=16, fontproperties=font_prop)
+plt.legend(loc='lower right', fontsize=12, prop=error_legend_font_prop)  # 设置图例位置和字体
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)  # 设置x轴刻度字体大小
+plt.yticks(fontproperties=font_prop, fontsize=14)  # 设置y轴刻度字体大小
+plt.savefig(os.path.join(save_dir, 'error_analysis_with_std_error_and_metrics.png'))  # 保存图片
+plt.show()
+
+#第五部分 单组预测
+import torch
+import numpy as np
+import joblib
+import matplotlib.pyplot as plt
+import os
+import matplotlib.font_manager as font_manager
+import pandas as pd
+
+# 假设字体文件 times.ttf 在当前工作目录
+font_path = '/mnt/workspace/times.ttf'  # 确认路径正确
+font_manager.fontManager.addfont(font_path)
+font_prop = font_manager.FontProperties(fname=font_path, size=18)  # 设置字体大小为 18
+
+# 图例字体大小
+legend_font_prop = font_manager.FontProperties(fname=font_path, size=12)  # 设置对比图图例字体大小为 12
+error_legend_font_prop = font_manager.FontProperties(fname=font_path, size=14)  # 设置误差图图例字体大小为 14
+
+# 确保保存图片的目录存在
+save_dir = '/mnt/workspace/预测结果'
+os.makedirs(save_dir, exist_ok=True)
+
+# 加载训练好的模型和标准化器
+model_path = 'transformer_model_no_teacher_forcing_自定义阈值.pth'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TransformerModel(input_dim=9, target_dim=1).to(device)
+model.load_state_dict(torch.load(model_path))
+model.eval()
+
+input_scaler = joblib.load('input_scaler.pkl2')
+target_scaler = joblib.load('target_scaler.pkl2')
+
+# 手动输入的一组参数
+manual_input = np.array([[36, 10000, 1000, 1.05, 1.05, 1.40E-04, 1.26E-04, 1.50E-04, 0.76]])
+manual_input_scaled = input_scaler.transform(manual_input)
+
+# 将输入数据转换为 tensor 并调整形状
+input_seq = torch.tensor(manual_input_scaled, dtype=torch.float32).unsqueeze(0).to(device).permute(1, 0, 2)  # [1, batch_size, input_dim]
+
+# 频率数组
+frequency = np.array([
+    500, 515, 530, 545, 560, 580, 600, 615, 630, 650, 670, 690, 710, 730, 750, 775, 
+    800, 825, 850, 875, 900, 925, 950, 975, 1000, 1030, 1060, 1090, 1120, 1150, 
+    1180, 1220, 1250, 1280, 1320, 1360, 1400, 1450, 1500, 1550, 1600, 1650, 1700, 
+    1750, 1800, 1850, 1900, 1950, 2000, 2060, 2120, 2180, 2240, 2300, 2360, 2430, 
+    2500, 2580, 2650, 2720, 2800, 2900, 3000
+])
+
+# 预测过程
+with torch.no_grad():
+    # 编码器生成上下文向量
+    encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+    encoder_output = model.pos_encoder(encoder_output)
+    memory = model.transformer.encoder(encoder_output)
+
+    # 准备解码器输入和掩码
+    decoder_input = torch.zeros((63, 1, 1), device=input_seq.device)
+    tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+    # 自回归预测
+    for t in range(1, 63):
+        decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+    decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+    decoder_input = model.pos_encoder(decoder_input)
+    output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+    output = model.decoder(output)
+
+    predicted_values = output.permute(1, 0, 2).squeeze(2).cpu().numpy()
+    predicted_values = target_scaler.inverse_transform(predicted_values)
+
+# 打印预测结果
+print("Predicted Values:")
+print(predicted_values.flatten())
+
+# 保存预测结果到 Excel 文件
+predicted_values_df = pd.DataFrame(predicted_values.flatten(), columns=['Predicted Values'])
+output_file_path = os.path.join(save_dir, 'predicted_values.xlsx')
+predicted_values_df.to_excel(output_file_path, index=False)
+print(f"Predicted values saved to {output_file_path}")
+
+# 绘制预测结果
+plt.figure(figsize=(12, 6))
+plt.plot(frequency, predicted_values.flatten(), color='blue', marker='o', linestyle='-', label='Predicted Values')
+plt.xlabel('Frequency (Hz)', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Predicted Sound Absorption Coefficient', fontsize=16, fontproperties=font_prop)
+plt.legend(loc='lower right', fontsize=14, prop=legend_font_prop)  # 设置图例位置和字体
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)  # 设置x轴刻度字体大小
+plt.yticks(fontproperties=font_prop, fontsize=14)  # 设置y轴刻度字体大小
+plt.savefig(os.path.join(save_dir, 'manual_input_prediction.png'))  # 保存图片
+plt.show()
+
+#第六部分 pso
+import torch
+import numpy as np
+import joblib
+import matplotlib.pyplot as plt
+import os
+import matplotlib.font_manager as font_manager
+import pandas as pd
+from pyswarm import pso
+
+# 假设字体文件 times.ttf 在当前工作目录
+font_path = '/mnt/workspace/times.ttf'  # 确认路径正确
+font_manager.fontManager.addfont(font_path)
+font_prop = font_manager.FontProperties(fname=font_path, size=18)  # 设置字体大小为 18
+
+# 图例字体大小
+legend_font_prop = font_manager.FontProperties(fname=font_path, size=12)  # 设置对比图图例字体大小为 12
+error_legend_font_prop = font_manager.FontProperties(fname=font_path, size=14)  # 设置误差图图例字体大小为 14
+
+# 确保保存图片的目录存在
+save_dir = '/mnt/workspace/预测结果'
+os.makedirs(save_dir, exist_ok=True)
+
+# 加载训练好的模型和标准化器
+model_path = 'transformer_model_no_teacher_forcing_自定义阈值.pth'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TransformerModel(input_dim=9, target_dim=1).to(device)
+model.load_state_dict(torch.load(model_path))
+model.eval()
+
+input_scaler = joblib.load('input_scaler.pkl2')
+target_scaler = joblib.load('target_scaler.pkl2')
+
+# 频率数组
+frequency = np.array([
+    500, 515, 530, 545, 560, 580, 600, 615, 630, 650, 670, 690, 710, 730, 750, 775, 
+    800, 825, 850, 875, 900, 925, 950, 975, 1000, 1030, 1060, 1090, 1120, 1150, 
+    1180, 1220, 1250, 1280, 1320, 1360, 1400, 1450, 1500, 1550, 1600, 1650, 1700, 
+    1750, 1800, 1850, 1900, 1950, 2000, 2060, 2120, 2180, 2240, 2300, 2360, 2430, 
+    2500, 2580, 2650, 2720, 2800, 2900, 3000
+])
+
+# 频率段的索引范围
+freq_indices = np.where((frequency >= 1000) & (frequency <= 2000))[0]
+
+# 权重参数
+w1 = 5.0
+w2 = 1.0
+w3 = 1.0
+
+# 定义目标函数
+def objective_function(params):
+    # 将输入参数标准化
+    params_scaled = input_scaler.transform(params.reshape(1, -1))
+
+    # 将输入数据转换为 tensor 并调整形状
+    input_seq = torch.tensor(params_scaled, dtype=torch.float32).unsqueeze(0).to(device).permute(1, 0, 2)
+
+    with torch.no_grad():
+        # 编码器生成上下文向量
+        encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+        encoder_output = model.pos_encoder(encoder_output)
+        memory = model.transformer.encoder(encoder_output)
+
+        # 准备解码器输入和掩码
+        decoder_input = torch.zeros((63, 1, 1), device=input_seq.device)
+        tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+        # 自回归预测
+        for t in range(1, 63):
+            decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+        decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+        decoder_input = model.pos_encoder(decoder_input)
+        output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+        output = model.decoder(output)
+
+        predicted_values = output.permute(1, 0, 2).squeeze(2).cpu().numpy()
+        predicted_values = target_scaler.inverse_transform(predicted_values)
+
+    # 计算1000-2000 Hz频率段的吸声系数
+    absorption_coefficients = predicted_values[0, freq_indices]
+
+    # 平均吸声系数
+    mean_absorption = absorption_coefficients.mean()
+
+    # 吸声系数方差的平方根
+    variance_absorption = np.sqrt(((absorption_coefficients - mean_absorption) ** 2).mean())
+
+    # 最小吸声系数
+    min_absorption = absorption_coefficients.min()
+
+    # 适应度函数
+    fitness = w1 * mean_absorption - w2 * variance_absorption + w3 * min_absorption
+
+    return -fitness  # PSO 需要最小化目标函数
+
+# PSO 参数设置
+lb = [10, 10000, 1000, 1, 1, 1.00E-04, 1.00E-04, 1.00E-04, 0.49]  # 参数下界
+ub = [100, 24000, 9000, 2, 2, 1.80E-04, 1.72E-04, 2.00E-04, 0.99]  # 参数上界
+
+# 执行PSO优化
+optimal_params, optimal_value = pso(objective_function, lb, ub, swarmsize=30, maxiter=50)
+
+# 将最优参数标准化
+optimal_params_scaled = input_scaler.transform(optimal_params.reshape(1, -1))
+
+# 预测最优参数的吸声系数
+input_seq = torch.tensor(optimal_params_scaled, dtype=torch.float32).unsqueeze(0).to(device).permute(1, 0, 2)
+
+with torch.no_grad():
+    # 编码器生成上下文向量
+    encoder_output = model.src_embedding(input_seq) * np.sqrt(model.d_model)
+    encoder_output = model.pos_encoder(encoder_output)
+    memory = model.transformer.encoder(encoder_output)
+
+    # 准备解码器输入和掩码
+    decoder_input = torch.zeros((63, 1, 1), device=input_seq.device)
+    tgt_mask = generate_square_subsequent_mask(decoder_input.size(0)).to(input_seq.device)
+
+    # 自回归预测
+    for t in range(1, 63):
+        decoder_input[t] = model.decoder(model.pos_encoder(model.tgt_embedding(decoder_input[t-1:t]))).detach()
+
+    decoder_input = model.tgt_embedding(decoder_input) * np.sqrt(model.d_model)
+    decoder_input = model.pos_encoder(decoder_input)
+    output = model.transformer.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+    output = model.decoder(output)
+
+    optimal_predicted_values = output.permute(1, 0, 2).squeeze(2).cpu().numpy()
+    optimal_predicted_values = target_scaler.inverse_transform(optimal_predicted_values)
+
+# 打印最优参数及其对应的吸声系数
+print("Optimal Parameters:")
+print(optimal_params)
+print("Predicted Absorption Coefficient for Optimal Parameters:")
+print(optimal_predicted_values.flatten())
+
+# 保存最优参数预测结果到 Excel 文件
+optimal_predicted_values_df = pd.DataFrame(optimal_predicted_values.flatten(), columns=['Optimal Predicted Values'])
+optimal_output_file_path = os.path.join(save_dir, 'optimal_predicted_values.xlsx')
+optimal_predicted_values_df.to_excel(optimal_output_file_path, index=False)
+print(f"Optimal predicted values saved to {optimal_output_file_path}")
+
+# 绘制最优参数预测结果
+plt.figure(figsize=(12, 6))
+plt.plot(frequency, optimal_predicted_values.flatten(), color='blue', marker='o', linestyle='-', label='Optimal Predicted Values')
+plt.xlabel('Frequency (Hz)', fontsize=16, fontproperties=font_prop)
+plt.ylabel('Predicted Sound Absorption Coefficient', fontsize=16, fontproperties=font_prop)
+plt.legend(loc='lower right', fontsize=14, prop=legend_font_prop)  # 设置图例位置和字体
+plt.grid(True)
+plt.xticks(fontproperties=font_prop, fontsize=14)  # 设置x轴刻度字体大小
+plt.yticks(fontproperties=font_prop, fontsize=14)  # 设置y轴刻度字体大小
+plt.savefig(os.path.join(save_dir, 'optimal_manual_input_prediction.png'))  # 保存图片
+plt.show()
